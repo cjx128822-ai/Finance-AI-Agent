@@ -1,0 +1,27 @@
+# Python 缓存文件
+__pycache__/
+*.pyc
+
+# 虚拟环境
+venv/
+env/
+.venv/
+miniforge3/
+miniconda3/
+anaconda3/
+
+# AI 模型权重与向量库 (防巨无霸)
+*.faiss
+*.pkl
+*.bin
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.gguf
+*.json
+knowledge/
+models/
+
+# 系统隐藏文件
+.DS_Store
