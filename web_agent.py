@@ -4,10 +4,11 @@ from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
 from langchain_core.tools import Tool
 import os
-
+os.environ["NO_PROXY"] = "localhost,127.0.0.1,::1"
+os.environ["no_proxy"] = "localhost,127.0.0.1,::1" # 大小写都加上，彻底防死
 # 导入你之前写好的绝密武器
 from tools import get_realtime_stock_price, search_local_news
-
+from fastapi.responses import StreamingResponse
 # ==========================================
 # 🌟 大厂级后端：FastAPI 接口层必备导入
 # ==========================================
@@ -21,9 +22,10 @@ llm = ChatOpenAI(
     openai_api_key="EMPTY",
     openai_api_base="http://localhost:8000/v1",
     model_name="finance-llm",
-    temperature=0.1,
+    temperature=0.4,
     max_tokens=1024,
-    stop=["Observation:", "\nObservation"]  # ⬅️ 直接这样写
+    streaming=True, # ⬅️ 关键：开启流式输出
+    stop=["Observation:", "\nObservation"]
 )
 
 # 2. 组装工具箱
@@ -45,7 +47,7 @@ react_template = """你是一个专业的金融分析助手。你必须严格基
 你可以使用以下工具：
 {tools}
 
-必须严格遵循以下ReAct对话格式（注意冒号必须是半角英文冒号）：
+必须严格遵循以下ReAct对话格式（注意冒号必须是半角英文冒号，且严格保持换行）：
 
 Question: 用户的输入问题
 Thought: 思考你需要做什么。
@@ -54,32 +56,29 @@ Action Input: 传给工具的具体搜索参数
 Observation: (工具返回的结果)
 ... (Thought/Action/Action Input/Observation 可以重复多次)
 Thought: 我已经掌握了需要的信息，准备输出最终答案。
-Final Answer: 
-【数据查询结果】：在这里写具体的数字或数据。如果没有，写“无”。
-【新闻与背景】：在这里写查询到的新闻细节。如果没有，写“无”。
-【综合结论】：在这里写最终的简短总结。
+Final Answer: 你的最终回答。
 
---- 下面是一个标准的操作示例，请严格模仿这个格式 ---
-Question: 帮我查一下特斯拉(TSLA)的股价，以及它最近的自动驾驶新闻。
-Thought: 我需要先用 get_realtime_stock_price 查 TSLA 的股价，然后再用 search_local_news 查自动驾驶的新闻。
+--- [场景1：需要查询数据的标准操作示例] ---
+Question: 帮我查一下特斯拉(TSLA)的股价。
+Thought: 我需要先用 get_realtime_stock_price 查 TSLA 的股价。
 Action: get_realtime_stock_price
 Action Input: TSLA
 Observation: TSLA 当前的最新收盘价为 180.50 USD
-Thought: 股价查到了，我现在需要查新闻。
-Action: search_local_news
-Action Input: 特斯拉 自动驾驶
-Observation: 检索到的极其精准且覆盖面广的背景知识：特斯拉宣布FSD自动驾驶系统重大升级...
-Thought: 股价和新闻都查到了，我现在可以输出最终回答了。
+Thought: 股价查到了，我现在可以输出最终回答了。
 Final Answer: 
 【数据查询结果】：TSLA 当前的最新收盘价为 180.50 USD。
-【新闻与背景】：特斯拉宣布FSD自动驾驶系统迎来了重大升级。
-【综合结论】：特斯拉(TSLA)目前股价为 180.50 USD。近期公司在自动驾驶(FSD)技术上取得了重要突破。
---- 示例结束 ---
+【新闻与背景】：无。
+【综合结论】：特斯拉(TSLA)目前股价为 180.50 USD。
 
+--- [场景2：遇到日常闲聊或挑衅辱骂时的标准操作示例] ---
+Question: (用户打招呼或辱骂的话)
+Thought: 这是一个不需要使用工具的场景。我绝对不能去查股票或新闻，我应该直接输出 Final Answer。
+Final Answer: [根据用户的语气自由发挥。如果用户打招呼，请礼貌回应；如果用户辱骂，请进行强硬反击。每次务必使用完全不同的词汇，严禁当复读机！]
+--- 示例结束 ---
 🚨【最高警告】🚨：
-1. 绝对不要在 Thought 中直接写答案！答案必须写在 Final Answer: 后面！
-2. 必须且只能包含一个 Final Answer: (务必使用英文冒号)。
-3. 请忘掉你脑子里预训练的旧知识，一切以 Observation 返回的结果为准！
+1. 绝对不要在 Thought 中直接写答案！答案必须单独写在 Final Answer: 的后面！
+2. 遇到闲聊或辱骂，绝对不允许使用工具！你可以参考[场景2]的思维格式，但【必须使用你自己的话】来输出 Final Answer！遇到辱骂要强硬反击，每次用词都要不一样，绝对不能当一字不差的复读机！
+3. 请忘掉你脑子里预训练的旧知识，查数据必须看 Observation！
 
 过去的聊天记录（如果有的话，请作为上下文参考，但请务必优先回答当前的 Question）：
 {chat_history}
@@ -91,7 +90,11 @@ Thought: {agent_scratchpad}"""
 prompt = PromptTemplate.from_template(react_template)
 
 # 创建记忆对象 (保留原有的记忆功能)
-memory = ConversationBufferMemory(memory_key="chat_history")
+# 加上 output_key="output"，明确告诉它只存 output
+memory = ConversationBufferMemory(
+    memory_key="chat_history",
+    output_key="output"  # 👈 加上这行，彻底治好它的强迫症
+)
 
 # 4. 组装智能体执行器
 agent = create_react_agent(llm, tools, prompt)
@@ -124,25 +127,32 @@ class ChatRequest(BaseModel):
 
 
 # 暴露对话接口给前端
+# 暴露对话接口给前端（流式版本）
 @app.post("/api/chat")
 async def chat_endpoint(request: ChatRequest):
     print(f"\n[🚀 API 接收] 前端传来问题: {request.message}")
 
-    try:
-        # 把前端的问题喂给我们的 Agent 大脑
-        result = agent_executor.invoke({"input": request.message})
+    # 定义一个内部生成器函数，用来“挤牙膏”
+    async def generate_response():
+        try:
+            # 开启异步的 agent stream
+            async for chunk in agent_executor.astream_events(
+                    {"input": request.message},
+                    version="v1"  # 必须指定 v1 版本 API
+            ):
+                # 只捕获最终大模型说话的内容，跳过工具调用的内部思考
+                if chunk["event"] == "on_chat_model_stream":
+                    content = chunk["data"]["chunk"].content
+                    if content:
+                        # 核心：将文本编码成字节流吐出去
+                        yield content.encode("utf-8")
 
-        # 返回标准 JSON 给前端
-        return {
-            "status": "success",
-            "reply": result['output']
-        }
-    except Exception as e:
-        print(f"[💥 API 报错] {str(e)}")
-        return {
-            "status": "error",
-            "reply": f"不好意思，我的大脑短路了：{str(e)}"
-        }
+        except Exception as e:
+            error_msg = f"\n❌ 大脑短路了: {str(e)}"
+            yield error_msg.encode("utf-8")
+
+    # 使用 FastAPI 专用的 StreamingResponse 返回这个生成器
+    return StreamingResponse(generate_response(), media_type="text/plain")
 
 
 if __name__ == "__main__":
