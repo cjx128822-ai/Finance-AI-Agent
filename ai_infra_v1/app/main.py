@@ -1,13 +1,21 @@
+import asyncio
+import json
 import logging
 import os
 import time
 import uuid
 from contextlib import asynccontextmanager
 
+import redis.asyncio as aioredis
+from celery.result import AsyncResult
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from sse_starlette.sse import EventSourceResponse
+
+from celery_app import celery_app
+from tasks import run_inference, _stream_key
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,28 +33,41 @@ class RequestIdFilter(logging.Filter):
 logger = logging.getLogger("ai_infra")
 logger.addFilter(RequestIdFilter())
 
-APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
-MODEL_NAME = os.getenv("MODEL_NAME", "mock-llm")
+APP_VERSION = os.getenv("APP_VERSION", "2.0.0")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen2.5-7B-Instruct")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0")
+
+# SSE 调优
+SSE_BLOCK_MS = 15000        # XREAD 单次阻塞时长
+SSE_IDLE_TIMEOUT_S = 600    # 整个连接最长空闲时间，超时主动关闭
+SSE_HEARTBEAT_S = 15        # 心跳间隔，防止 Nginx/网关 idle 断开
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    app.state.redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        await app.state.redis.ping()
+        app.state.ready = True
+    except Exception:
+        logger.exception("redis ping failed", extra={"request_id": "boot"})
+        app.state.ready = False
+    app.state.started_at = time.time()
     logger.info(
-        "service startup | version=%s | model=%s", APP_VERSION, MODEL_NAME,
+        "service startup | version=%s | model=%s | redis=%s",
+        APP_VERSION, MODEL_NAME, REDIS_URL,
         extra={"request_id": "boot"},
     )
-    # 真实场景在此处加载模型、连接数据库、预热缓存
-    app.state.ready = True
-    app.state.started_at = time.time()
     yield
     app.state.ready = False
+    await app.state.redis.aclose()
     logger.info("service shutdown", extra={"request_id": "boot"})
 
 
 app = FastAPI(
-    title="AI Infra Demo",
-    description="生产级 FastAPI 模板：健康探针 / 请求追踪 / 结构化日志 / Nginx 友好",
+    title="AI Infra Demo (Async)",
+    description="FastAPI + Celery + Redis 异步 LLM 服务：投递任务 + SSE 流式输出",
     version=APP_VERSION,
     lifespan=lifespan,
 )
@@ -62,14 +83,13 @@ app.add_middleware(
 
 @app.middleware("http")
 async def request_context(request: Request, call_next):
-    # 优先取 Nginx 透传的 X-Request-ID，方便全链路追踪
     request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
     request.state.request_id = request_id
 
     start = time.perf_counter()
     try:
         response = await call_next(request)
-    except Exception as exc:
+    except Exception:
         logger.exception(
             "unhandled exception | path=%s", request.url.path,
             extra={"request_id": request_id},
@@ -91,18 +111,28 @@ async def request_context(request: Request, call_next):
     return response
 
 
+# ===== Schemas =====
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000, description="用户输入")
+    message: str = Field(..., min_length=1, max_length=4000, description="用户输入")
     user_id: str | None = Field(default=None, description="可选用户标识，用于日志/限流")
 
 
-class ChatResponse(BaseModel):
-    reply: str
-    model: str
-    latency_ms: float
+class ChatSubmitResponse(BaseModel):
+    task_id: str
+    stream_url: str
+    status_url: str
     request_id: str
 
 
+class TaskStatusResponse(BaseModel):
+    task_id: str
+    status: str
+    ready: bool
+    result: dict | None = None
+    error: str | None = None
+
+
+# ===== Meta / Probe =====
 @app.get("/", tags=["meta"])
 async def root():
     return {
@@ -113,38 +143,124 @@ async def root():
     }
 
 
-# Liveness：进程是否还活着。失败 → 重启容器
 @app.get("/health", tags=["probe"])
 async def health():
     return {"status": "alive"}
 
 
-# Readiness：是否可以接收流量。失败 → 摘流量但不重启
 @app.get("/ready", tags=["probe"])
 async def ready():
     if not getattr(app.state, "ready", False):
         raise HTTPException(status_code=503, detail="service not ready")
+    try:
+        await app.state.redis.ping()
+    except Exception:
+        raise HTTPException(status_code=503, detail="redis unreachable")
     return {"status": "ready"}
 
 
-@app.post("/api/v1/chat", response_model=ChatResponse, tags=["llm"])
-async def chat(req: ChatRequest, request: Request):
+# ===== Chat: 投递 =====
+@app.post("/api/v1/chat", response_model=ChatSubmitResponse, status_code=202, tags=["llm"])
+async def submit_chat(req: ChatRequest, request: Request):
     request_id = request.state.request_id
-    start = time.perf_counter()
+    async_result: AsyncResult = run_inference.apply_async(
+        kwargs={
+            "message": req.message,
+            "user_id": req.user_id,
+            "request_id": request_id,
+        },
+        # 通过 Celery headers 透传 request_id，方便 worker 端日志关联
+        headers={"X-Request-ID": request_id},
+    )
+    task_id = async_result.id
 
     logger.info(
-        "chat | user=%s | msg_len=%d",
-        req.user_id or "anon", len(req.message),
+        "chat submit | task_id=%s | user=%s | msg_len=%d",
+        task_id, req.user_id or "anon", len(req.message),
         extra={"request_id": request_id},
     )
 
-    # 占位：真实场景对接 vLLM / 自研 Agent / 外部 LLM API
-    reply = f"[{MODEL_NAME}] 你说的是：{req.message}"
-
-    latency_ms = (time.perf_counter() - start) * 1000
-    return ChatResponse(
-        reply=reply,
-        model=MODEL_NAME,
-        latency_ms=round(latency_ms, 2),
+    return ChatSubmitResponse(
+        task_id=task_id,
+        stream_url=f"/api/v1/chat/stream/{task_id}",
+        status_url=f"/api/v1/tasks/{task_id}",
         request_id=request_id,
+    )
+
+
+# ===== Chat: SSE 流式输出 =====
+async def _sse_event_stream(redis_client: aioredis.Redis, task_id: str, request_id: str):
+    """从 Redis Stream 读取 worker 产生的事件，转为 SSE。"""
+    stream = _stream_key(task_id)
+    last_id = "0-0"  # 从头读，保证客户端晚于 task 启动也能补到所有事件
+    deadline = time.monotonic() + SSE_IDLE_TIMEOUT_S
+    last_event_at = time.monotonic()
+
+    while True:
+        if time.monotonic() > deadline:
+            yield {"event": "error", "data": json.dumps({"detail": "sse idle timeout"})}
+            return
+
+        try:
+            entries = await redis_client.xread({stream: last_id}, block=SSE_BLOCK_MS, count=64)
+        except asyncio.CancelledError:
+            logger.info("sse client disconnect | task_id=%s", task_id, extra={"request_id": request_id})
+            raise
+        except Exception:
+            logger.exception("sse xread failed | task_id=%s", task_id, extra={"request_id": request_id})
+            yield {"event": "error", "data": json.dumps({"detail": "stream backend error"})}
+            return
+
+        if not entries:
+            # 空轮询期间发心跳，防止 Nginx idle 断开
+            if time.monotonic() - last_event_at > SSE_HEARTBEAT_S:
+                yield {"event": "ping", "data": "{}"}
+                last_event_at = time.monotonic()
+            continue
+
+        for _key, items in entries:
+            for entry_id, fields in items:
+                last_id = entry_id
+                last_event_at = time.monotonic()
+                event_name = fields.get("event", "message")
+                yield {"event": event_name, "data": fields.get("data", "{}")}
+                if event_name in ("done", "error"):
+                    return
+
+
+@app.get("/api/v1/chat/stream/{task_id}", tags=["llm"])
+async def stream_chat(task_id: str, request: Request):
+    request_id = request.state.request_id
+    redis_client: aioredis.Redis = app.state.redis
+    logger.info("sse subscribe | task_id=%s", task_id, extra={"request_id": request_id})
+
+    return EventSourceResponse(
+        _sse_event_stream(redis_client, task_id, request_id),
+        ping=SSE_HEARTBEAT_S,
+        headers={"X-Accel-Buffering": "no"},  # 双保险，提示 Nginx 不要缓冲
+    )
+
+
+# ===== 任务状态查询（断线重连 / 兜底）=====
+@app.get("/api/v1/tasks/{task_id}", response_model=TaskStatusResponse, tags=["llm"])
+async def task_status(task_id: str):
+    res = AsyncResult(task_id, app=celery_app)
+    if res.failed():
+        return TaskStatusResponse(
+            task_id=task_id,
+            status=res.status,
+            ready=True,
+            error=str(res.result),
+        )
+    if res.successful():
+        return TaskStatusResponse(
+            task_id=task_id,
+            status=res.status,
+            ready=True,
+            result=res.result if isinstance(res.result, dict) else {"value": res.result},
+        )
+    return TaskStatusResponse(
+        task_id=task_id,
+        status=res.status,
+        ready=False,
     )

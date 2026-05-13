@@ -1,32 +1,78 @@
 name: ai-infra-v1
 
+# 一份镜像跑三种角色（app / worker / flower），构建一次复用
+x-app-image: &app-image
+  build:
+    context: ./app
+    dockerfile: Dockerfile
+  image: ai-infra-app:2.0.0
+
+x-app-env: &app-env
+  TZ: "Asia/Shanghai"
+  APP_VERSION: "2.0.0"
+  MODEL_NAME: "Qwen2.5-7B-Instruct"
+  ALLOWED_ORIGINS: "*"
+  REDIS_URL: "redis://redis:6379/0"
+  CELERY_RESULT_BACKEND: "redis://redis:6379/1"
+  # 宿主机上 vLLM 服务（OpenAI 兼容，端口 8000）
+  VLLM_BASE_URL: "http://host.docker.internal:8000/v1"
+  VLLM_MODEL: "/home/jinxiangchen/models/Qwen2.5-7B-Instruct"
+  VLLM_API_KEY: "EMPTY"
+
 services:
-  app:
-    build:
-      context: ./app
-      dockerfile: Dockerfile
-    image: ai-infra-app:1.0.0
-    container_name: ai-infra-app
-    # 不对外暴露端口：只允许 Nginx 通过内部网络访问
-    # 想本地直连调试时取消下面注释
-    # ports:
-    #   - "8000:8000"
-    environment:
-      APP_VERSION: "1.0.0"
-      MODEL_NAME: "mock-llm"
-      ALLOWED_ORIGINS: "*"
-      TZ: "Asia/Shanghai"
+  redis:
+    image: redis:7.2-alpine
+    container_name: ai-infra-redis
+    # appendonly 持久化：worker 崩溃重启后未消费任务不丢
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - "512mb"
+      - --maxmemory-policy
+      - "allkeys-lru"
+    volumes:
+      - redis_data:/data
     restart: unless-stopped
     networks:
       - backend
-    # 容器层资源限制：防止单服务吃光宿主机
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     deploy:
       resources:
         limits:
-          cpus: "2.0"
-          memory: 1G
-        reservations:
-          memory: 256M
+          cpus: "1.0"
+          memory: 768M
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  app:
+    <<: *app-image
+    container_name: ai-infra-app
+    command: >
+      uvicorn main:app
+      --host 0.0.0.0 --port 8000 --workers 1
+      --proxy-headers --forwarded-allow-ips=*
+    environment: *app-env
+    extra_hosts:
+      # 让容器可以解析宿主机，访问宿主机上的 vLLM
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 1G}
+        reservations: {memory: 256M}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
@@ -35,9 +81,72 @@ services:
       start_period: 10s
     logging:
       driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      options: {max-size: "10m", max-file: "3"}
+
+  worker:
+    <<: *app-image
+    container_name: ai-infra-worker
+    # --concurrency=2: 单 worker 进程内 2 个 prefork 子进程
+    # LLM 任务实际并发由 vLLM 的 batching 决定，这里调小避免反向打爆 vLLM
+    # --prefetch-multiplier 已在 celery_app.py 设为 1，再次显式确认
+    command: >
+      celery -A celery_app worker
+      --loglevel=info
+      --concurrency=2
+      --queues=inference
+      --hostname=worker@%h
+    environment:
+      <<: *app-env
+      # worker 不需要监听 HTTP，关掉无关变量节省内存（保留键避免 yaml 报错）
+      APP_VERSION: "2.0.0-worker"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits: {cpus: "2.0", memory: 1G}
+        reservations: {memory: 256M}
+    # SIGTERM 后给 worker 60s 完成当前任务再退出
+    stop_grace_period: 60s
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A celery_app inspect ping -d worker@$(hostname) || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  flower:
+    <<: *app-image
+    container_name: ai-infra-flower
+    command: >
+      celery -A celery_app flower
+      --port=5555
+      --url_prefix=flower
+      --persistent=True
+      --db=/data/flower.db
+    environment: *app-env
+    volumes:
+      - flower_data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits: {cpus: "0.5", memory: 256M}
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
 
   nginx:
     image: nginx:1.27-alpine
@@ -45,12 +154,10 @@ services:
     ports:
       - "80:80"
     volumes:
-      # 只读挂载配置：防止容器内进程篡改宿主机文件
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - nginx_logs:/var/log/nginx
     depends_on:
       app:
-        # 等 app 健康检查通过再起 Nginx,避免上游全是 502
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -63,9 +170,7 @@ services:
       start_period: 5s
     logging:
       driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+      options: {max-size: "10m", max-file: "3"}
 
 networks:
   backend:
@@ -73,3 +178,5 @@ networks:
 
 volumes:
   nginx_logs:
+  redis_data:
+  flower_data:
