@@ -1,0 +1,38 @@
+# ===== 深度学习核心 =====
+torch>=2.1.0
+transformers>=4.40.0
+accelerate>=0.30.0
+peft>=0.10.0
+bitsandbytes>=0.43.0
+datasets>=2.18.0
+
+# ===== 训练监控 =====
+swanlab>=0.3.0
+
+# ===== LangChain Agent 框架 =====
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-huggingface>=0.0.3
+langchain-openai>=0.1.0
+langchain-text-splitters>=0.2.0
+
+# ===== RAG 检索 =====
+faiss-cpu>=1.8.0
+sentence-transformers>=2.7.0
+rank-bm25>=0.2.2
+jieba>=0.42.1
+
+# ===== Web 服务 =====
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+gradio>=4.0.0
+pydantic>=2.0.0
+
+# ===== 工具与数据 =====
+openai>=1.30.0
+yfinance>=0.2.40
+pandas>=2.0.0
+
+# ===== vLLM 推理加速（可选，部署阶段使用）=====
+# vllm>=0.5.0
